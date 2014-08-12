@@ -1,0 +1,528 @@
+#!/usr/bin/env python
+#Author: Nguyen Duc Trung Dung
+#check_iDRAC
+#Network Operator at GHP FarEast - ndtdung@ghp-fareast.vn, dung.nguyendt@gmail.com
+#Blog: ndtdung.blogspot.com
+##################################################################################
+
+import commands, sys, optparse, re, string, os
+run = commands.getstatusoutput
+
+#GET OPTION
+optp = optparse.OptionParser()
+optp.add_option('--man', help='show manual', action='store_true', dest='man')
+optp.add_option('-H', '--host', help='hostname or IP address', dest='host')
+optp.add_option('-v', help='SNMP version', type='int', dest='snmp')
+optp.add_option('-c', help='SNMPv2 community', dest='community')
+optp.add_option('-u', '--user', help='SNMPv3 user', dest='user')
+optp.add_option('-l', '--level', help='set security level (noAuthNoPriv|authNoPriv|authPriv)', dest='lev')
+optp.add_option('-a', help='set authentication protocol (MD5|SHA)', dest='auth')
+optp.add_option('-A', help='set authentication protocol pass phrase', dest='auth_pass')
+optp.add_option('-x', help='set privacy protocol (DES|AES)', dest='pri')
+optp.add_option('-X', help='set privacy protocol pass phrase', dest='pri_pass')
+optp.add_option('-f', '--file', help='use SNMP auth file instead', dest='file')
+optp.add_option('-i', '--item', help='item to scan', dest='item')
+optp.add_option('--mincrit', help='minimum CRITICAL threshold', dest='mincrit', type='string')
+optp.add_option('--maxcrit', help='maximum CRITICAL threshold', dest='maxcrit', type='string')
+optp.add_option('--minwarn', help='minimum WARNING threshold', dest='minwarn', type='string')
+optp.add_option('--maxwarn', help='maximum WARNING threshold', dest='maxwarn', type='string')
+optp.add_option('--ipmiconfig', help='absolute path to ipmitool,user,password file location', dest='ipmi')
+optp.add_option('--all', help='scan hardware info and show result', action='store_true', dest='list')
+opts, args = optp.parse_args()
+#--Show manual
+if opts.man is True:
+    print 'Check_iDRAC for DELL PowerEdge R720 (may used with others if they use same MIBs)'
+    print 'Author: Nguyen Duc Trung Dung. Network Operator at GHP FarEast'
+    print 'Email: ndtdung@ghp-fareast.vn | dung.nguyendt@gmail.com'
+    print 'Blog: ndtdung.blogspot.com'
+    print ''
+    print '----------------------------------------------------------------'
+    print '!!!!REMEMBER TO LOAD INCLUDED MIB FILE TO YOUR MIB DIRECTORY!!!!'
+    print '----------------------------------------------------------------'
+    print ''
+    print 'Check_iDRAC use SNMPWALK to get SNMP information and IPMI from iDRAC and parse into Nagios format.'
+    print 'So you need net-snmp, ipmi(optional) installed on your system, also as Python'
+    print 'Check_iDRAC check for informations as:'
+    print '    FAN'
+    print '    PSU'
+    print '    PHYSICAL DISK'
+    print '    TEMPERATURE SENSOR'
+    print '    MEMORY'
+    print '    CPU'
+    print ''
+    print 'SNMP AUTHENTICATION FILE SAMPLE'
+    print '-------------------------------'
+    print ' SNMPv3'
+    print '    1: sha'
+    print '    2: my_authentication_passphrase'
+    print '    3: aes'
+    print '    4: my_privacy_passphrase'
+    print '    5: authPriv'
+    print ' SNMPv2'
+    print '    1: public'
+    print ''
+    print 'Use --all to scan hardware info on your iDRAC'
+    print 'Choose one item to use with -i|--item'
+    print ' ./check_iDRAC -H 192.168.1.1 -v 3 -u user -f /tmp/authfile --all'
+    print ' ./check_iDRAC -H 192.168.1.1 -v 3 -u user -f /tmp/authfile -i MEM'
+    print ''
+    print 'IPMI CONFIG OPTION'
+    print '------------------'
+    print 'Specify IPMITOOL will help check_iDRAC get information as: FAN RPM, POWER SUPPLY VOLT/AMP'
+    print 'Usage:'
+    print '--ipmiconfig=[executable],[ipmi username],[ipmi authentication file]'
+    print '--ipmiconfig=/usr/bin/ipmitool,ipmiuser,/tmp/imp_auth'
+    print ''
+    print 'ALERT THRESHOLD'
+    print '---------------'
+    print 'check_iDRAC will automatically alert on bad state or status of device'
+    print '    (!!) : critical state or status'
+    print '    (!)  : other states or status'
+    print ''
+    print 'When -i|--item is specified check_iDRAC will output to Nagios format'
+    print '-i|--item can be item group name or specific item'
+    print '--minwarn, --mincrit, --maxcrit --maxwarn only available to -i|--item option'
+    print 'Usage:'
+    print 'FAN: --minwarn=[THRESHOLD]'
+    print 'TEMP: --minwarn=[THRESHOLD]'
+    print 'POWER: --minwarn=[VOL_THRESHOLD],[AMP_THRESHOLD]'
+    print ''
+    print 'Note that --all will not show ALERT prefix (CRIT - /WARN - )'
+    optp.print_help()
+    sys.exit(0)
+
+#--Threshold
+if opts.mincrit is None or opts.minwarn is None or opts.maxcrit is None or opts.maxwarn is None:
+    check_threshold = 0
+else:
+    if opts.item is None:
+        print 'ERROR - Item must be specified for threshold checking'
+        sys.exit(2)
+    else:
+        check_threshold = 1
+
+
+#--Requried options
+if opts.host is None:
+    optp.print_help()
+    sys.exit(2)
+else:
+    if opts.snmp is None:
+        print 'ERROR - You forgot to specify SNMP Version'
+        sys.exit(2)
+    else:
+        if opts.snmp == 3:
+            if opts.file is None:
+                if opts.lev is None or opts.user is None or opts.auth is None or opts.auth_pass is None or opts.pri is None or opts.pri_pass is None:
+                    optp.print_help()
+                    sys.exit(2)
+                else:
+                    pass
+            else:
+                #--read auth file
+                try:
+                    f = open(opts.file, 'r')
+                except IOError as e:
+                    print e
+                    sys.exit(2)
+                else:
+                    info = f.read().split('\n')
+                    f.close()
+                    opts.auth = info[0]
+                    opts.auth_pass = info[1]
+                    opts.pri = info[2]
+                    opts.pri_pass = info [3]
+                    opts.lev = info[4]
+        elif opts.snmp == 2:
+            if opts.community is None:
+                optp.print_help()
+                sys.exit(0)
+
+
+#OID MAPPING
+alltype = {'MEM': ['IDRAC-MIB::memoryDeviceTable', '1.3.6.1.4.1.674.10892.5.4.1100.50'],
+           'PSU': ['IDRAC-MIB::powerSupplyTable', 'IDRAC-MIB::powerUnitTable', '.1.3.6.1.4.1.674.10892.5.4.600.12'],
+           'CPU': ['IDRAC-MIB::processorDeviceTable', '1.3.6.1.4.1.674.10892.5.4.1100.30'],
+           'TEMP_SENSOR': ['IDRAC-MIB::temperatureProbeTable', '1.3.6.1.4.1.674.10892.5.4.700.20'],
+           'FAN_UNIT': ['IDRAC-MIB::coolingUnitTable', '1.3.6.1.4.1.674.10892.5.4.700.10'],
+           'DISK': ['IDRAC-MIB::physicalDiskTable', '1.3.6.1.4.1.674.10892.5.5.1.20.130.4']
+}
+
+#--Set default oids is all type
+oids = sorted(alltype.keys())
+
+#--Check if item is specified or list all
+if opts.list is not True:
+    if opts.item is None:
+        optp.print_help()
+        sys.exit(2)
+    else:
+        oids = []
+        item_no = opts.item.split('#')
+        oids.append(item_no[0])
+        if len(item_no) > 1:
+            try:
+                oid_num = int(item_no[1]) - 1
+            except:
+                print 'ERROR - Item number should be INTEGER!'
+                sys.exit(2)
+            else:
+                if oid_num < 0:
+                    print 'ERROR - Item order start from #1'
+                    sys.exit(2)
+                isbreak = 1
+        elif len(item_no) == 1:
+            oid_num = 0
+            isbreak = 0
+else:
+    oid_num = 0
+    isbreak = 0
+#GET SNMP FUNCTION
+def parse_snmp(oid_name, pattern, out):
+    items = []
+    for i in out.split('\n'):
+        if pattern.search(i):
+            items.append([i.split('::')[1].split(' ')[0].split('.')[0], ' '.join(i.split('::')[1].split(' ')[1:]).replace('"', '').strip()]) #Split name to 1st, Value to 2nd
+    #--Count device
+    num = 0
+    for item in items:
+        if item[0] == oid_name:
+            num += 1
+    if oid_num + 1 > num:
+        print 'ERROR - %s not exists' % (opts.item)
+        sys.exit(2)
+    return items, num
+
+#RETURN CODE FUNCTION
+def check_code(*checklists): #dynamic number of varaiable
+    codes = ['UNKNOWN', ''] #set default code is UNKNOWN
+    flag = 3
+    for i in range(0, len(checklists)):
+        codes.append(i)
+        OK = re.compile('ok|enabled|online|spunup|full|ready', re.IGNORECASE)
+        CRIT = re.compile('critical|nonRecoverable|fail', re.IGNORECASE)
+        if OK.search(checklists[i]):
+            codes[0] = 'OK'
+            codes[i+1] = ''
+            flag = 0
+        elif CRIT.search(checklists[i]):
+            codes[0] = 'CRIT'
+            codes[i+1] = '(!!)'
+            flag = 2
+        else:
+            if codes[0] != 'CRIT':
+                codes[0] = 'WARN'
+                codes[i+1] = '(!)'
+                flag = 1
+    codes.append(flag)
+    return codes
+
+#IMPI FUNCTION
+def parse_ipmi(type, minwarn, maxwarn, mincrit, maxcrit):
+    if opts.ipmi is None:
+        return '', 'ok'
+    else:
+        ipmi = opts.ipmi.split(',')
+        ip_l = ipmi[0]
+        ip_u = ipmi[1]
+        ip_f = ipmi[2]
+        if os.path.exists(ip_l) is True:
+            try:
+                f = open(ip_f, 'r')
+            except IOError as e:
+                print 'ERROR -', e
+                sys.exit(2)
+            else:
+                f.close()
+                cmd = ip_l + ' -H %s -U %s -f %s sdr|grep -i %s' % (opts.host, ip_u, ip_f, type)
+                stat, out = run(cmd)
+                if stat != 0:
+                    print 'ERROR -', out
+                    sys.exit(2)
+                else:
+                    ipmis = []
+                    code = 'ok'
+                    for i in out.split('\n'):
+                        name = i.split('|')[0].replace(type.upper(), '').strip()
+                        value = i.split('|')[1].strip()
+                        val = float(value.split(' ')[0])
+                        stat = i.split('|')[2].strip().upper()
+                        if check_threshold == 1:
+                            #Trigger check_ipmi threshold
+                            #--check value
+                            if float(mincrit) >= val or val >= float(maxcrit):
+                                value += '(!!)'
+                                code = 'critical'
+                            elif float(minwarn) >= val or val >= float(maxwarn):
+                                value += '(!)'
+                                if code != 'critical':
+                                    code = 'warning'
+                        else:
+                            #Ignore threshold
+                            pass
+                        #--check status
+                        if not 'OK' in stat:
+                            stat += '(!!)'
+                            code = 'critical'
+                        ipmis.append([name, value, stat])
+                    result = []
+                    for ipmi in ipmis:
+                        result.append('(%s: %s, Status: %s)' % (ipmi[0], ipmi[1], ipmi[2]))
+                    return result, code
+        else:
+            print 'ERROR - Can not find ipmitool util'
+            sys.exit(2)
+
+#PRINT RESULT FUNCTION
+def print_result():
+    if opts.list is True:
+        print '    ' + '%s' % ('\n    '.join(msg))
+    else:
+        msg_perf = ''
+        if isbreak == 1 and len(perf) > 0:
+            msg_perf = '|' + ' '.join(perf)
+        if isbreak == 0:
+            print '    ' + '%s' % ('\n    '.join(msg))
+        else:
+            print '%s - %s%s' % (codes[0], ''.join(msg), msg_perf)
+            sys.exit(codes[-1])
+
+#MAIN PROGRAM
+cmd = 'snmpwalk %s -O q -v %s -u %s -l %s -a %s -A %s -x %s -X %s ' %(opts.host, opts.snmp, opts.user, opts.lev, opts.auth, opts.auth_pass, opts.pri, opts.pri_pass)
+for oid in oids:
+    if opts.list is True:
+        print '#--' + oid
+    else:
+        if isbreak == 0:
+            print '#--' + oid
+    #--Check DEVICE valid
+    if not any(oid == i for i in alltype.keys()):
+        print 'ERROR - Unknown device type: %s. See --help|--man for help!' % (oid)
+        sys.exit(2)
+    #--Run SNMPWALK
+    stat, out = run(cmd + alltype[oid][0])
+    if stat != 0:
+        print 'ERROR -', out
+        sys.exit(2)
+    #--MEMORY
+    if oid == 'MEM':
+        msg = []
+        perf = []
+        pattern = re.compile('memoryDeviceIndex|'
+                             'memoryDeviceStateSettings|'
+                             'memoryDeviceStatus|'
+                             'memoryDeviceType|'
+                             'memoryDeviceLocationName|'
+                             'memoryDeviceSize|'
+                             'memoryDeviceSpeed|'
+                             'memoryDeviceManufacturerName|'
+                             'memoryDeviceSerialNumberName', re.IGNORECASE)
+        items, num = parse_snmp('memoryDeviceIndex', pattern, out)
+        #--Print memory device info
+        for i in range(oid_num, num):
+            #--analyze memory result
+            mem_status = items[i+num*2][1].translate(None, string.digits).replace('()','')
+            mem_state = items[i+num][1].translate(None, string.digits).replace('()','')
+            codes = check_code(mem_status, mem_state)
+            msg.append('[%s#%s] State: %s, Status: %s, Size: %sGB, Speed: %s, Type: %s, Location: %s, Manufacturer: %s, S.N: %s'\
+                  % (oid, i+1, mem_state.upper() + codes[2], mem_status.upper() + codes[1], int(items[i+num*5][1])/(1024*1024), items[i+num*6][1], items[i+num*3][1].replace('deviceTypeIs', ''), items[i+num*4][1], items[i+num*7][1], items[i+num*8][1]))
+            if isbreak == 1:
+                break
+        print_result()
+    #--POWERSUPPLY
+    elif oid == 'PSU':
+        #Power checking
+        if check_threshold == 1:
+            if len(opts.minwarn.split(',')) == 2 and len(opts.maxwarn.split(',')) == 2 and len(opts.mincrit.split(',')) == 2 and len(opts.maxcrit.split(',')) == 2:
+                minw_vol = opts.minwarn.split(',')[0]
+                maxw_vol = opts.maxwarn.split(',')[0]
+                minc_vol = opts.mincrit.split(',')[0]
+                maxc_vol = opts.maxcrit.split(',')[0]
+                minw_a = opts.minwarn.split(',')[1]
+                maxw_a = opts.maxwarn.split(',')[1]
+                minc_a = opts.mincrit.split(',')[1]
+                maxc_a = opts.maxcrit.split(',')[1]
+            else:
+                print 'ERROR - Not enough threshold value. See --man for details'
+                sys.exit(2)
+        else:
+            minw_vol = ''
+            maxw_vol = ''
+            minc_vol = ''
+            maxc_vol = ''
+            minw_a = ''
+            maxw_a = ''
+            minc_a = ''
+            maxc_a = ''
+
+        perf = []
+        perf_vol = []
+        perf_am = []
+        #--ipmi
+        vol_ip, vol_ip_code = parse_ipmi('volt', minw_vol, maxw_vol, minc_vol, maxc_vol)
+        am_ip, am_ip_code = parse_ipmi('amp', minw_a, maxw_a, minc_a, maxc_a)
+        if opts.ipmi is not None:
+            for z in vol_ip:
+                perf_vol.append('PS%s%s=%s;;;;' % (z.split(' ')[1].replace(':','_'), z.split(' ')[0].replace('(',''), z.split(' ')[2]))
+            for z in am_ip:
+                perf_am.append('PS%sAmps=%s;;;;' % (z.split(' ')[1].replace(':','_'), z.split(' ')[2]))
+            perf.append(' '.join(perf_vol))
+            perf.append(' '.join(perf_am))
+        #--get PU
+        stat, out_unit = run(cmd + str(alltype[oid][1]))
+        if stat != 0:
+            print 'ERROR -', out
+            sys.exit(2)
+        out = out + '\n' + out_unit
+        msg = []
+        msg_ps = []
+        msg_pu = []
+        pattern_ps = re.compile('powerSupplyIndex|'
+                                'powerSupplyStatus', re.IGNORECASE)
+        items_ps, num_ps = parse_snmp('powerSupplyIndex', pattern_ps, out)
+        pattern_pu = re.compile('powerUnitIndex|'
+                                'powerUnitStateSettings|'
+                                'powerUnitRedundancyStatus|'
+                                'powerUnitName|'
+                                'powerUnitStatus', re.IGNORECASE)
+        items_pu, num_pu = parse_snmp('powerUnitIndex', pattern_pu, out)
+        #--Print POWER summarize info
+        #--PS
+        for i in range(oid_num, num_ps):
+            ps_status = items_ps[i+num_ps*1][1].translate(None, string.digits).replace('()','')
+            codes = check_code(ps_status)
+            if opts.ipmi is None:
+            #--no ipmi
+                msg_ps.append('(PS%s status: %s)' % (items_ps[i][1], ps_status.upper() + codes[1]))
+            else:
+                msg_ps.append('(PS%s: %s Amps, %s Volts, Status: %s)' % (items_ps[i][1], am_ip[i].split(' ')[2], vol_ip[i].split(' ')[2], ps_status.upper() + codes[1]))
+        #--Get final code
+        msg_ps = '**'.join(msg_ps)
+        if '(!!)' in msg_ps:
+            ps_code = 'critical'
+        elif '(!)' in msg_ps:
+            ps_code = 'warning'
+        else:
+            ps_code = 'ok'
+        #--PU
+        for i in range(oid_num, num_pu):
+            pu_state = items_pu[i+num_pu*1][1].translate(None, string.digits).replace('()','')
+            pu_status = items_pu[i+num_pu*4][1].translate(None, string.digits).replace('()','')
+            pu_re_status = items_pu[i+num_pu*2][1].translate(None, string.digits).replace('()','')
+            codes = check_code(pu_state, pu_status, pu_re_status, ps_code)
+            msg_pu.append('[%s#%s] %s, State: %s, Status: %s, RedundancyStatus: %s'
+                          % (oid, i+1, items_pu[i+num_pu*3][1], pu_state.upper() + codes[1], pu_status.upper() + codes[2], pu_re_status.upper() + codes[3]))
+            if isbreak == 1:
+                break
+        msg.append(''.join(msg_pu) + ' ' + msg_ps)
+        print_result()
+
+    #--PROCESSOR
+    elif oid == 'CPU':
+        msg = []
+        perf = []
+        pattern = re.compile('processorDeviceIndex|'
+                             'processorDeviceStateSettings|'
+                             'processorDeviceStatus.1|'
+                             'processorDeviceCoreCount|'
+                             'processorDeviceThreadCount|'
+                             'processorDeviceBrandName', re.IGNORECASE)
+        items, num = parse_snmp('processorDeviceIndex', pattern, out)
+        #--Print PROCESSOR device info
+        for i in range(oid_num, num):
+            pr_state = items[i+num*1][1].translate(None, string.digits).replace('()','')
+            pr_status = items[i+num*2][1].translate(None, string.digits).replace('()','')
+            codes = check_code(pr_state, pr_status)
+            msg.append('[%s#%s] State: %s, Status: %s, %s: %s cores/%s threads'
+                       % (oid, i+1, pr_state.upper() + codes[1], pr_status.upper() + codes[2], items[i+num*5][1], items[i+num*3][1], items[i+num*4][1]))
+            if isbreak == 1:
+                break
+        print_result()
+    #--TEMPERATURE_SENSOR
+    elif oid == 'TEMP_SENSOR':
+        msg = []
+        perf = []
+        pattern = re.compile('temperatureProbeIndex|'
+                             'temperatureProbeStateSettings|'
+                             'temperatureProbeStatus|'
+                             'temperatureProbeReading|'
+                             'temperatureProbeLocationName', re.IGNORECASE)
+        items, num = parse_snmp('temperatureProbeIndex', pattern, out)
+        #--Print TEMPERATURE device info
+        for i in range(oid_num, num):
+            tm_state = items[i+num*1][1].translate(None, string.digits).replace('()','')
+            tm_status = items[i+num*2][1].translate(None, string.digits).replace('()','')
+            tm_read = int(items[i+num*3][1])/10
+            if check_threshold == 1:
+                if int(opts.mincrit) >= tm_read or tm_read >= int(opts.maxcrit):
+                    tm_read_code = 'critical'
+                elif int(opts.minwarn) >= tm_read or tm_read >= int(opts.maxwarn):
+                    tm_read_code = 'warning'
+                else:
+                    tm_read_code = 'ok'
+            else:
+                tm_read_code = 'ok'
+            codes = check_code(tm_state, tm_status, tm_read_code)
+            msg.append('[%s#%s] %s: %s C degrees, State: %s, Status: %s'
+                       % (oid, i+1, items[i+num*4][1], str(tm_read) + codes[3], tm_state.upper() + codes[1], tm_status.upper() + codes[2]))
+            perf.append('%s%s=%i' % (oid, i+1, tm_read)+ ';;;;' )
+            if isbreak == 1:
+                break
+        print_result()
+    #--FAN
+    elif oid == 'FAN_UNIT':
+        perf = []
+        #--ipmi
+        fans_ip, fan_ip_code = parse_ipmi('rpm', opts.minwarn, opts.maxwarn, opts.mincrit, opts.maxcrit)
+        fan_ip = '**'.join(fans_ip)
+        if opts.ipmi is not None:
+            for z in fans_ip:
+                perf.append('%s%s;;;;' % (z.split(' ')[0].replace('(','').replace(':','='), z.split(' ')[1]))
+        #--snmp
+        msg = []
+        pattern = re.compile('coolingUnitIndex|'
+                             'coolingUnitStateSettings|'
+                             'coolingUnitRedundancyStatus|'
+                             'coolingUnitName|'
+                             'coolingUnitStatus', re.IGNORECASE)
+        items, num = parse_snmp('coolingUnitIndex', pattern, out)
+        #--Print FAN device info
+        for i in range(oid_num, num):
+            fan_state = items[i+num*1][1].translate(None, string.digits).replace('()','')
+            fan_status = items[i+num*4][1].translate(None, string.digits).replace('()','')
+            fan_re_status = items[i+num*2][1].translate(None, string.digits).replace('()','')
+            codes = check_code(fan_state, fan_status, fan_re_status, fan_ip_code)
+            msg.append('[%s#%s] %s, State: %s, Status: %s, RedundancyStatus: %s %s'
+                       % (oid, i+1, items[i+num*3][1], fan_state.upper(), fan_status.upper(), fan_re_status.upper(), fan_ip))
+            if isbreak == 1:
+                break
+        print_result()
+    #--PHYSICAL_DISK
+    elif oid == 'DISK':
+        msg = []
+        perf = []
+        pattern = re.compile('physicalDiskNumber|'
+                             'physicalDiskName|'
+                             'physicalDiskManufacturer|'
+                             'physicalDiskState|'
+                             'physicalDiskSerialNo|'
+                             'physicalDiskCapacityInMB|'
+                             'physicalDiskSpareState|'
+                             'physicalDiskComponentStatus|'
+                             'physicalDiskPowerState|'
+                             'physicalDiskOperationalState|'
+                             'physicalDiskDisplayName', re.IGNORECASE)
+        items, num = parse_snmp('physicalDiskNumber', pattern, out)
+        #--Print PD device info
+        for i in range(oid_num, num):
+            pd_state = items[i+num*3][1].translate(None, string.digits).replace('()','')
+            pd_spare_state = items[i+num*6][1].translate(None, string.digits).replace('()','')
+            pd_power_state = items[i+num*8][1].translate(None, string.digits).replace('()','')
+            pd_operation_state = items[i+num*9][1].translate(None, string.digits).replace('()','')
+            pd_status = items[i+num*7][1].translate(None, string.digits).replace('()','')
+            codes = check_code(pd_state, pd_power_state, pd_status)
+            msg.append('[%s#%s] %s, Status: %s, State: %s, SpareState: %s, OperationState: %s, PowerState: %s, Size: %sGB, Manufacturer: %s, S.N: %s, %s'
+                       % (oid, i+1, items[i+num][1], pd_status.upper() + codes[3], pd_state.upper() + codes[1], pd_spare_state.upper(), pd_operation_state.upper(), pd_power_state.upper() + codes[2], int(items[i+num*5][1])/1024, items[i+num*2][1], items[i+num*4][1].replace('"', ''), items[i+num*10][1]) )
+            if isbreak == 1:
+                break
+        print_result()
